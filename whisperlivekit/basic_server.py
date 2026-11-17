@@ -7,16 +7,19 @@ from typing import List, Optional
 
 from fastapi import APIRouter, FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 
 from whisperlivekit import AudioProcessor, TranscriptionEngine, get_inline_ui_html, parse_args
 from whisperlivekit.api_auth import websocket_token
 from whisperlivekit.config import WhisperLiveKitConfig, parse_cors_origins
+from whisperlivekit.live_broadcast import LiveBroadcast
 from whisperlivekit.processing_queue import PipelineClosed, PipelineOverloaded
+from whisperlivekit.rtsp_input import RTSPInputError, feed_rtsp_audio, parse_rtsp_url
 from whisperlivekit.session_limits import WebSocketSessionLimitMiddleware
 from whisperlivekit.timed_objects import FrontData
 from whisperlivekit.timed_objects import format_subtitle_timestamp as _srt_timestamp
+from whisperlivekit.web.web_interface import get_live_viewer_html
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,28 @@ async def get():
     return HTMLResponse(get_inline_ui_html())
 
 
+@router.get("/input")
+async def live_input():
+    return HTMLResponse(get_inline_ui_html(broadcast_input=True))
+
+
+@router.get("/viewer")
+async def live_viewer():
+    return HTMLResponse(get_live_viewer_html())
+
+
+@router.get("/viewer/events")
+async def live_viewer_events(request: Request):
+    token = _bearer_token(request) or request.query_params.get("token")
+    if not _token_ok(token, request):
+        return JSONResponse({"error": "Invalid or missing API token"}, status_code=401)
+    return StreamingResponse(
+        request.app.state.live_broadcast.events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.get("/health")
 async def health(request: Request):
     """Health check endpoint."""
@@ -79,19 +104,24 @@ async def health(request: Request):
     })
 
 
-async def handle_websocket_results(websocket, results_generator, diff_tracker=None):
+async def handle_websocket_results(websocket, results_generator, diff_tracker=None, broadcast=None):
     """Consumes results from the audio processor and sends them via WebSocket."""
     try:
         async for response in results_generator:
+            snapshot = response.to_dict() if diff_tracker is None or broadcast is not None else None
+            if broadcast is not None:
+                broadcast.publish(snapshot)
             if diff_tracker is not None:
                 await websocket.send_json(diff_tracker.to_message(response))
             else:
-                await websocket.send_json(response.to_dict())
+                await websocket.send_json(snapshot)
             if response.status == "error":
                 await websocket.close(code=1011, reason="transcription failed")
                 return
         # when the results_generator finishes it means all audio has been processed
         logger.info("Results generator finished. Sending 'ready_to_stop' to client.")
+        if broadcast is not None:
+            broadcast.update("finished")
         await websocket.send_json({"type": "ready_to_stop"})
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected while handling results (client likely closed connection).")
@@ -119,6 +149,16 @@ async def websocket_endpoint(websocket: WebSocket):
     session_target_language = websocket.query_params.get("target_language", None)
     session_context = websocket.query_params.get("context", None)
 
+    broadcast = None
+    if websocket.query_params.get("broadcast") == "1":
+        broadcast = websocket.app.state.live_broadcast
+        if broadcast.active:
+            await websocket.accept()
+            await websocket.send_json({"type": "error", "error": "An audio input is already live."})
+            await websocket.close(code=4409)
+            return
+    rtsp_input = broadcast is not None and websocket.query_params.get("source") == "rtsp"
+
     try:
         audio_processor = AudioProcessor(
             transcription_engine=transcription_engine,
@@ -126,6 +166,7 @@ async def websocket_endpoint(websocket: WebSocket):
             mode=mode,
             target_language=session_target_language,
             context=session_context,
+            pcm_input=True if rtsp_input else None,
         )
     except ValueError as e:
         # Bad per-session parameters (e.g. a language the backend does not
@@ -138,6 +179,9 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.warning("WebSocket rejected: %s", e)
         return
     websocket_task = None
+    rtsp_task = None
+    if broadcast is not None:
+        broadcast.start()
     try:
         await websocket.accept()
         logger.info(
@@ -156,24 +200,39 @@ async def websocket_endpoint(websocket: WebSocket):
 
         await websocket.send_json({
             "type": "config",
-            "useAudioWorklet": bool(config.pcm_input),
+            "useAudioWorklet": not rtsp_input and bool(config.pcm_input),
             "mode": mode,
             "context": session_context_capability(
                 transcription_engine.args,
                 transcription_engine.asr,
             ),
         })
+        if rtsp_input:
+            try:
+                source_message = await asyncio.wait_for(websocket.receive_json(), timeout=20)
+            except (ValueError, KeyError, asyncio.TimeoutError):
+                raise RTSPInputError("Send the RTSP stream URL to start transcription.") from None
+            rtsp_url = parse_rtsp_url(source_message)
+
         results_generator = await audio_processor.create_tasks()
         websocket_task = asyncio.create_task(
-            handle_websocket_results(websocket, results_generator, diff_tracker)
+            handle_websocket_results(websocket, results_generator, diff_tracker, broadcast)
         )
+        if rtsp_input:
+            async def announce_rtsp_audio():
+                await websocket.send_json({"type": "rtsp_audio"})
+
+            rtsp_task = asyncio.create_task(feed_rtsp_audio(rtsp_url, audio_processor, announce_rtsp_audio))
         audio_ended = False
         while True:
             receive_task = asyncio.create_task(websocket.receive_bytes())
             try:
+                session_tasks = [receive_task, websocket_task]
+                if rtsp_task is not None:
+                    session_tasks.append(rtsp_task)
                 done, _ = await asyncio.wait(
-                    (receive_task, websocket_task),
-                    timeout=None if audio_ended else config.session_idle_timeout or None,
+                    session_tasks,
+                    timeout=None if audio_ended or rtsp_input else config.session_idle_timeout or None,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
@@ -188,7 +247,23 @@ async def websocket_endpoint(websocket: WebSocket):
                     ):
                         await websocket.close(code=1000)
                     break
-                message = receive_task.result()  # propagate disconnects
+                if rtsp_input:
+                    if receive_task in done:
+                        message = receive_task.result()  # propagate disconnects
+                        if message:
+                            raise RTSPInputError("RTSP input accepts only a stop signal after the stream URL.")
+                    if rtsp_task in done:
+                        await rtsp_task  # propagate source failures
+                        rtsp_task = None
+                    elif rtsp_task is not None:
+                        rtsp_task.cancel()
+                        await asyncio.gather(rtsp_task, return_exceptions=True)
+                        rtsp_task = None
+                    if audio_ended:
+                        continue
+                    message = b""
+                else:
+                    message = receive_task.result()  # propagate disconnects
             finally:
                 if not receive_task.done():
                     receive_task.cancel()
@@ -204,8 +279,14 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.error(f"Unexpected KeyError in websocket_endpoint: {e}", exc_info=True)
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected by client during message receiving loop.")
+    except RTSPInputError as exc:
+        broadcast.update("error")
+        await websocket.send_json({"type": "error", "error": str(exc)})
+        await websocket.close(code=4400, reason="RTSP input failed")
     except Exception as e:
         logger.error(f"Unexpected error in websocket_endpoint main loop: {e}", exc_info=True)
+        if broadcast is not None:
+            broadcast.update("error")
         try:
             await websocket.send_json({
                 "type": "error",
@@ -216,12 +297,17 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.debug("WebSocket was already disconnected", exc_info=True)
     finally:
         logger.info("Cleaning up WebSocket endpoint...")
-        if websocket_task is not None:
-            if not websocket_task.done():
-                websocket_task.cancel()
-            await asyncio.gather(websocket_task, return_exceptions=True)
+        tasks = [task for task in (rtsp_task, websocket_task) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-        await audio_processor.cleanup()
+        try:
+            await audio_processor.cleanup()
+        finally:
+            if broadcast is not None:
+                broadcast.release()
         logger.info("WebSocket endpoint cleaned up successfully.")
 
 
@@ -676,6 +762,7 @@ def create_app(server_config: WhisperLiveKitConfig | None = None) -> FastAPI:
     """Build an ASGI application without reading the host process's arguments."""
     application = FastAPI(lifespan=lifespan)
     application.state.config = server_config if server_config is not None else WhisperLiveKitConfig()
+    application.state.live_broadcast = LiveBroadcast()
     application.add_middleware(
         WebSocketSessionLimitMiddleware,
         max_sessions=application.state.config.max_concurrent_sessions,

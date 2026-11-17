@@ -35,7 +35,7 @@
                     <input id="websocketInput" type="text" placeholder="ws://host:port/asr" />
                 </div>
 
-                <div class="field">
+                <div class="field" id="microphoneField">
                     <label id="microphoneSelectLabel" for="microphoneSelect">Select Microphone</label>
                     <select id="microphoneSelect">
                         <option value="">Default Microphone</option>
@@ -66,7 +66,22 @@
             </div>
         </div>
         
-        <p id="status"></p>
+        <div id="broadcastSource" hidden>
+            <div class="field">
+                <label for="sourceSelect">Audio source</label>
+                <select id="sourceSelect">
+                    <option value="microphone">Microphone</option>
+                    <option value="rtsp">RTSP stream</option>
+                </select>
+            </div>
+            <div class="field" id="rtspField" hidden>
+                <label for="rtspUrl">RTSP stream URL</label>
+                <input id="rtspUrl" type="text" inputmode="url" autocomplete="off"
+                       spellcheck="false" placeholder="rtsp://camera:554/stream" />
+            </div>
+        </div>
+        <p id="status" role="status"></p>
+        <p hidden id="broadcastViewer"><a href="viewer" target="_blank" rel="noopener">Open live transcript viewer</a></p>
     </div>
 
     <div class="transcript-container">

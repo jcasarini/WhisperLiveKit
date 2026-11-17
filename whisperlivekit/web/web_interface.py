@@ -13,7 +13,11 @@ def get_web_interface_html():
         logger.error(f"Error loading web interface HTML: {e}")
         return "<html><body><h1>Error loading interface</h1></body></html>"
 
-def get_inline_ui_html():
+def get_live_viewer_html():
+    return resources.files("whisperlivekit.web").joinpath("live_viewer.html").read_text(encoding="utf-8")
+
+
+def get_inline_ui_html(broadcast_input=False):
     """Returns the complete web interface HTML with all assets embedded in a single call."""
     try:
         with resources.files('whisperlivekit.web').joinpath('live_transcription.html').open('r', encoding='utf-8') as f:
@@ -87,6 +91,9 @@ def get_inline_ui_html():
             f'<img src="{settings_uri}" alt="" />'
         )
 
+        if broadcast_input:
+            html_content = html_content.replace("<body>", '<body data-broadcast-input>')
+            html_content = html_content.replace("<title>WhisperLiveKit</title>", "<title>WhisperLiveKit Audio Input</title>")
         return html_content
 
     except Exception as e:

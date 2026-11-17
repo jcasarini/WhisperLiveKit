@@ -281,10 +281,24 @@ body {
   gap: 3px;
 }
 
+.field[hidden] {
+  display: none;
+}
+
+#broadcastSource {
+  margin-top: 12px;
+}
+
+#rtspField {
+  margin-top: 8px;
+}
+
 #chunkSelector,
 #websocketInput,
 #themeSelector,
-#microphoneSelect {
+#microphoneSelect,
+#sourceSelect,
+#rtspUrl {
   font-size: 16px;
   padding: 5px 8px;
   border-radius: 8px;

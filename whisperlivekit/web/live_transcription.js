@@ -28,7 +28,7 @@ let availableMicrophones = [];
 let selectedMicrophoneId = null;
 let serverUseAudioWorklet = null;
 let configReadyResolve;
-const configReady = new Promise((r) => (configReadyResolve = r));
+let configReady = new Promise((r) => (configReadyResolve = r));
 let outputAudioContext = null;
 let audioSource = null;
 const LAG_DISPLAY_THRESHOLD = 0.1;
@@ -134,9 +134,12 @@ if (darkMq && darkMq.addEventListener) {
 }
 
 async function enumerateMicrophones() {
+  if (!navigator.mediaDevices || (broadcastInput && sourceSelect.value === "rtsp")) return;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach(track => track.stop());
+    if (!broadcastInput) {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(track => track.stop());
+    }
 
     const devices = await navigator.mediaDevices.enumerateDevices();
     availableMicrophones = devices.filter(device => device.kind === 'audioinput');
@@ -210,6 +213,23 @@ const defaultWebSocketUrl = `${protocol}://${host}${port ? ":" + port : ""}/asr`
 if (websocketDefaultSpan) websocketDefaultSpan.textContent = defaultWebSocketUrl;
 websocketInput.value = defaultWebSocketUrl;
 websocketUrl = defaultWebSocketUrl;
+const broadcastInput = document.body.hasAttribute("data-broadcast-input");
+const sourceSelect = document.getElementById("sourceSelect");
+const rtspUrlInput = document.getElementById("rtspUrl");
+let captureError = "";
+if (broadcastInput) {
+  document.getElementById("broadcastSource").hidden = false;
+  document.getElementById("broadcastViewer").hidden = false;
+  document.querySelector(".transcript-container").hidden = true;
+  recordButton.setAttribute("aria-label", "Start or stop audio input");
+  const showSourceFields = () => {
+    const usingRtsp = sourceSelect.value === "rtsp";
+    document.getElementById("rtspField").hidden = !usingRtsp;
+    document.getElementById("microphoneField").hidden = usingRtsp;
+  };
+  sourceSelect.addEventListener("change", showSourceFields);
+  showSourceFields();
+}
 
 // Optional chunk selector (guard for presence)
 if (chunkSelector) {
@@ -229,10 +249,21 @@ websocketInput.addEventListener("change", () => {
   statusText.textContent = "WebSocket URL updated. Ready to connect.";
 });
 
-function setupWebSocket() {
+function setupWebSocket(useRtsp = false) {
   return new Promise((resolve, reject) => {
+    let finished = false;
     try {
-      websocket = new WebSocket(websocketUrl);
+      const url = new URL(websocketUrl);
+      if (broadcastInput) {
+        configReady = new Promise((resolveConfig) => (configReadyResolve = resolveConfig));
+        url.searchParams.set("broadcast", "1");
+        if (useRtsp) url.searchParams.set("source", "rtsp");
+        else url.searchParams.delete("source");
+        const viewer = new URL("viewer", url);
+        viewer.protocol = url.protocol === "wss:" ? "https:" : "http:";
+        document.querySelector("#broadcastViewer a").href = viewer.href;
+      }
+      websocket = new WebSocket(url);
     } catch (error) {
       statusText.textContent = "Invalid WebSocket URL. Please check and try again.";
       reject(error);
@@ -245,6 +276,7 @@ function setupWebSocket() {
     };
 
     websocket.onclose = () => {
+      if (broadcastInput && configReadyResolve) configReadyResolve();
       if (userClosing) {
         if (waitingForStop) {
           statusText.textContent = "Processing finalized or connection closed.";
@@ -260,14 +292,16 @@ function setupWebSocket() {
             );
           }
         }
-      } else if (shouldReconnect && isRecording) {
+      } else if (!broadcastInput && shouldReconnect && isRecording) {
         // Unexpected close during an active session: keep the capture
         // pipeline and the displayed lines, and retry with backoff.
         websocket = null;
         scheduleReconnect();
         return;
       } else {
-        statusText.textContent = "Disconnected from the WebSocket server. (Check logs if model is loading.)";
+        if (!finished) {
+          statusText.textContent = captureError || "Disconnected from the WebSocket server. (Check logs if model is loading.)";
+        }
         if (isRecording) {
           stopRecording();
         }
@@ -278,6 +312,7 @@ function setupWebSocket() {
       lastReceivedData = null;
       websocket = null;
       updateUI();
+      if (captureError) statusText.textContent = captureError;
     };
 
     websocket.onerror = () => {
@@ -287,9 +322,22 @@ function setupWebSocket() {
 
     websocket.onmessage = (event) => {
       const data = JSON.parse(event.data);
+      if (broadcastInput) {
+        if (data.type === "rtsp_audio") {
+          if (isRecording) statusText.textContent = "Receiving RTSP audio.";
+          return;
+        }
+        if (data.error) {
+          captureError = data.error;
+          statusText.textContent = captureError;
+          if (configReadyResolve) configReadyResolve();
+          return;
+        }
+        if (data.type !== "config" && data.type !== "ready_to_stop") return;
+      }
       if (data.type === "config") {
         serverUseAudioWorklet = !!data.useAudioWorklet;
-        statusText.textContent = serverUseAudioWorklet
+        statusText.textContent = useRtsp ? "Connecting to RTSP stream…" : serverUseAudioWorklet
           ? "Connected. Using AudioWorklet (PCM)."
           : "Connected. Using MediaRecorder (WebM).";
         if (configReadyResolve) configReadyResolve();
@@ -304,6 +352,7 @@ function setupWebSocket() {
       }
 
       if (data.type === "ready_to_stop") {
+        finished = useRtsp;
         console.log("Ready to stop received, finalizing display and closing WebSocket.");
         waitingForStop = false;
 
@@ -319,7 +368,7 @@ function setupWebSocket() {
           );
         }
         statusText.textContent = "Finished processing audio! Ready to record again.";
-        recordButton.disabled = false;
+        recordButton.disabled = broadcastInput;
 
         if (websocket) {
           websocket.close();
@@ -683,6 +732,10 @@ async function startRecording() {
     }
 
     mediaStream = stream;
+    if (broadcastInput) void enumerateMicrophones();
+    if (broadcastInput && websocket?.readyState !== WebSocket.OPEN) {
+      throw new Error("Audio input disconnected before the microphone was ready");
+    }
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 256;
@@ -694,6 +747,9 @@ async function startRecording() {
         throw new Error("AudioWorklet is not supported in this browser");
       }
       await audioContext.audioWorklet.addModule("/web/pcm_worklet.js");
+      if (broadcastInput && websocket?.readyState !== WebSocket.OPEN) {
+        throw new Error("Audio input disconnected before the microphone was ready");
+      }
       workletNode = new AudioWorkletNode(audioContext, "pcm-forwarder", { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
       microphone.connect(workletNode);
 
@@ -734,6 +790,10 @@ async function startRecording() {
     shouldReconnect = true;
     updateUI();
   } catch (err) {
+    if (broadcastInput) {
+      websocket?.close();
+      await stopRecording();
+    }
     if (window.location.hostname === "0.0.0.0") {
       statusText.textContent =
         "Error accessing microphone. Browsers may block microphone access on 0.0.0.0. Try using localhost:8000 instead.";
@@ -809,6 +869,7 @@ async function stopRecording() {
     microphone.disconnect();
     microphone = null;
   }
+  if (broadcastInput) mediaStream?.getTracks().forEach((track) => track.stop());
   mediaStream = null;
 
   if (analyser) {
@@ -857,18 +918,44 @@ async function toggleRecording() {
       return;
     }
     console.log("Connecting to WebSocket");
+    captureError = "";
+    const useRtsp = broadcastInput && sourceSelect.value === "rtsp";
+    const rtspUrl = useRtsp ? rtspUrlInput.value.trim() : "";
+    if (useRtsp && !rtspUrl.startsWith("rtsp://")) {
+      statusText.textContent = "Enter an rtsp:// stream URL.";
+      rtspUrlInput.focus();
+      return;
+    }
+    if (broadcastInput) {
+      recordButton.disabled = true;
+      sourceSelect.disabled = true;
+      rtspUrlInput.disabled = true;
+    }
     try {
-      if (websocket && websocket.readyState === WebSocket.OPEN) {
-        await configReady;
-        await startRecording();
+      if (broadcastInput || !websocket || websocket.readyState !== WebSocket.OPEN) {
+        await setupWebSocket(useRtsp);
+      }
+      await configReady;
+      if (broadcastInput && (captureError || websocket?.readyState !== WebSocket.OPEN)) return;
+      if (useRtsp) {
+        websocket.send(JSON.stringify({ url: rtspUrl }));
+        isRecording = true;
+        startTime = Date.now();
+        timerInterval = setInterval(updateTimer, 1000);
+        updateUI();
+        statusText.textContent = "Connecting to RTSP stream…";
       } else {
-        await setupWebSocket();
-        await configReady;
         await startRecording();
       }
     } catch (err) {
-      statusText.textContent = "Could not connect to WebSocket or access mic. Aborted.";
+      statusText.textContent = useRtsp ? "Could not connect to the transcription server."
+        : "Could not connect to WebSocket or access mic. Aborted.";
       console.error(err);
+    } finally {
+      if (broadcastInput) {
+        recordButton.disabled = waitingForStop;
+        sourceSelect.disabled = rtspUrlInput.disabled = isRecording || waitingForStop;
+      }
     }
   } else {
     console.log("Stopping recording");
@@ -879,6 +966,7 @@ async function toggleRecording() {
 function updateUI() {
   recordButton.classList.toggle("recording", isRecording);
   recordButton.disabled = waitingForStop;
+  if (broadcastInput) sourceSelect.disabled = rtspUrlInput.disabled = isRecording || waitingForStop;
 
   if (waitingForStop) {
     if (statusText.textContent !== "Recording stopped. Processing final audio...") {
@@ -911,7 +999,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.log("Could not enumerate microphones on load:", error);
   }
 });
-navigator.mediaDevices.addEventListener('devicechange', async () => {
+navigator.mediaDevices?.addEventListener('devicechange', async () => {
   console.log('Device change detected, re-enumerating microphones');
   try {
     await enumerateMicrophones();

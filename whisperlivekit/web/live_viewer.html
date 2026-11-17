@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WhisperLiveKit Live Transcript</title>
+  <style>
+    :root { color-scheme: light dark; font: 100%/1.55 system-ui, sans-serif; }
+    body { max-width: 48rem; margin: 3rem auto; padding: 0 1.25rem; }
+    h1 { margin-bottom: .25rem; }
+    header { border-bottom: 1px solid GrayText; padding-bottom: 1rem; }
+    #status { margin: 0; }
+    #transcript { font-size: 1.25rem; overflow-wrap: anywhere; }
+    #transcript p { white-space: pre-wrap; }
+    .speaker, .translation { display: block; font-size: .85em; }
+    .speaker { font-weight: 600; }
+    .partial { font-style: italic; }
+    form { margin-top: 1rem; }
+    input, button { font: inherit; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Live transcript</h1>
+    <p id="status" role="status">Connecting…</p>
+    <form id="access" hidden>
+      <label for="token">Server API token</label>
+      <input id="token" type="password" autocomplete="off">
+      <button>Connect</button>
+    </form>
+  </header>
+  <main id="transcript" aria-label="Transcript"></main>
+  <script>
+    const statusText = document.getElementById("status");
+    const transcript = document.getElementById("transcript");
+    const access = document.getElementById("access");
+    const tokenInput = document.getElementById("token");
+    const states = {
+      waiting: "Waiting for audio input",
+      live: "Live",
+      finished: "Recording finished",
+      disconnected: "Audio input disconnected",
+      error: "Transcription failed"
+    };
+    let source;
+    let lastSnapshot = "";
+
+    function render(snapshot) {
+      const serialized = JSON.stringify(snapshot);
+      if (serialized === lastSnapshot) return;
+      lastSnapshot = serialized;
+      const follow = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 80;
+      const content = document.createDocumentFragment();
+      for (const line of snapshot?.lines || []) {
+        if (!line.text) continue;
+        const paragraph = document.createElement("p");
+        if (line.speaker > 0) {
+          const label = document.createElement("span");
+          label.className = "speaker";
+          label.textContent = `Speaker ${line.speaker} · ${line.start}`;
+          paragraph.append(label);
+        }
+        paragraph.append(line.text);
+        if (line.translation) {
+          const translation = document.createElement("span");
+          translation.className = "translation";
+          translation.textContent = line.translation;
+          paragraph.append(translation);
+        }
+        content.append(paragraph);
+      }
+      const partial = [snapshot?.buffer_diarization, snapshot?.buffer_transcription]
+        .filter(Boolean).join(" ");
+      if (partial || snapshot?.buffer_translation) {
+        const paragraph = document.createElement("p");
+        paragraph.className = "partial";
+        paragraph.textContent = [partial, snapshot.buffer_translation].filter(Boolean).join("\n");
+        content.append(paragraph);
+      }
+      transcript.replaceChildren(content);
+      if (follow) window.scrollTo(0, document.documentElement.scrollHeight);
+    }
+
+    function connect(token) {
+      source?.close();
+      statusText.textContent = "Connecting…";
+      const url = new URL(window.location.href);
+      url.pathname = url.pathname.replace(/\/$/, "") + "/events";
+      url.search = "";
+      url.hash = "";
+      if (token) url.searchParams.set("token", token);
+      source = new EventSource(url);
+      source.onmessage = ({ data }) => {
+        const { state, snapshot } = JSON.parse(data);
+        const message = states[state];
+        if (statusText.textContent !== message) statusText.textContent = message;
+        access.hidden = true;
+        render(snapshot);
+      };
+      source.onerror = () => {
+        const closed = source.readyState === EventSource.CLOSED;
+        statusText.textContent = closed ? "Unable to connect. Enter the API token if required." : "Reconnecting…";
+        access.hidden = !closed;
+      };
+    }
+
+    access.addEventListener("submit", (event) => {
+      event.preventDefault();
+      connect(tokenInput.value.trim());
+      tokenInput.value = "";
+    });
+    connect("");
+  </script>
+</body>
+</html>

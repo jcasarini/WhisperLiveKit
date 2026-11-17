@@ -372,6 +372,35 @@ asyncio.run(main())
 
 ---
 
+## Shared live transcript
+
+Open `/input` and select **Microphone** or **RTSP stream**. Open `/viewer`
+on any number of devices that can reach the same server. The viewer has no
+microphone controls and receives the latest transcript as soon as it connects.
+Stopping the input leaves the final transcript visible until the next recording.
+Microphone capture needs HTTPS when opened from a remote device.
+
+For RTSP, enter an `rtsp://` URL and press the record button. The WhisperLiveKit
+server needs FFmpeg and network access to the source. The stream must have an
+audio track and support RTSP over TCP. Press the same button to stop pulling
+audio and finalize the transcript.
+
+The server supports one shared recording per process. Run a single ASGI worker
+when using this feature. The shared transcript is held in memory and follows
+the server's streaming transcript retention settings. Use `/` for the combined
+microphone and transcript interface.
+
+To publish from a custom client, add `broadcast=1` to the native `/asr` URL.
+For RTSP, also add `source=rtsp`. After receiving the `config` message, send a
+text frame with JSON of the form `{"url":"rtsp://camera:554/stream"}`. The server
+sends `{"type":"rtsp_audio"}` when it first receives decoded audio. Send an
+empty binary frame to stop, then wait for `ready_to_stop`.
+Read `GET /viewer/events` as a server-sent event stream. Each message includes
+`state` and the latest full native transcript `snapshot` (or `null`).
+If the server requires authentication, enter the server token in the viewer
+or send it as a Bearer token from a custom client. On the audio input page,
+add the token to the WebSocket URL in Settings using the `token` query parameter.
+
 ## WebSocket Streaming API
 
 Both streaming routes share a server-configured session limit (64 per

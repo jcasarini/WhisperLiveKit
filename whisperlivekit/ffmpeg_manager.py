@@ -54,7 +54,7 @@ class FFmpegManager:
         self.state = FFmpegState.STOPPED
         self._state_lock = asyncio.Lock()
 
-    async def start(self) -> bool:
+    async def start(self, rtsp_url: Optional[str] = None) -> bool:
         try:
             async with self._state_lock:
                 if self.state != FFmpegState.STOPPED:
@@ -62,15 +62,21 @@ class FFmpegManager:
                     return False
                 self.state = FFmpegState.STARTING
                 self._stop_task = None
+                input_options = (
+                    ("-f", "rtsp", "-rtsp_transport", "tcp", "-allowed_media_types", "audio",
+                     "-protocol_whitelist", "tcp,rtp", "-i", rtsp_url, "-map", "0:a:0")
+                    if rtsp_url else ("-i", "pipe:0")
+                )
                 self.process = await asyncio.create_subprocess_exec(
                     "ffmpeg", "-hide_banner", "-loglevel", "error",
-                    "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le",
+                    *input_options, "-f", "s16le", "-acodec", "pcm_s16le",
                     "-ac", str(self.channels), "-ar", str(self.sample_rate), "pipe:1",
-                    stdin=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.DEVNULL if rtsp_url else asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL if rtsp_url else asyncio.subprocess.PIPE,
                 )
-                self._stderr_task = asyncio.create_task(self._drain_stderr())
+                if not rtsp_url:
+                    self._stderr_task = asyncio.create_task(self._drain_stderr())
                 self.state = FFmpegState.RUNNING
             logger.info("FFmpeg started.")
             return True
@@ -87,7 +93,10 @@ class FFmpegManager:
             return False
 
         except Exception as e:
-            logger.error(f"Error starting FFmpeg: {e}")
+            if rtsp_url:
+                logger.error("Error starting FFmpeg for RTSP: %s", type(e).__name__)
+            else:
+                logger.error(f"Error starting FFmpeg: {e}")
             async with self._state_lock:
                 self.state = FFmpegState.FAILED
             if self.on_error_callback:
